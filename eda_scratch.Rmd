@@ -1,0 +1,370 @@
+---
+title: "EDA"
+author: "Tory Norton"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = F, warning = F)
+library(tidyverse)
+library(sf)
+
+library(patchwork)
+library(scales)
+library(scico)
+library(RColorBrewer)
+library(ggridges)
+
+library(knitr)
+theme_set(theme_bw())
+heat_pal <- rev(brewer.pal(7, "RdBu"))
+```
+
+
+```{r}
+segs <- read.table("DadeSegs")
+colnames(segs) <- c("long1", "lat1", "long2", "lat2", "zip", "mystery")
+
+# run in temporary environment to avoid creating a million objects
+temp_env <- new.env()
+source("zip_polys.R", local = temp_env)
+zip_polys <- temp_env$zip_polys
+zip_lines <- temp_env$lines
+rm(temp_env)
+```
+
+```{r}
+load("dadeRE.RData")
+dade <- x
+```
+
+
+```{r}
+bID <- filter(dade, pairID == "b")$propertyID
+
+dade_a_matched0 <- dade %>% 
+  filter(pairID == "a", propertyID %in% bID)
+dade_a_matched <- dade_a_matched0 %>% 
+  rename_with(
+      ~ str_replace(
+          .x,
+          "\\d+$",
+          ~ as.character(as.numeric(.x) + 1)
+        ),
+      matches("\\d+$")
+    )
+
+dade_wide <- dade %>% 
+  anti_join(dade_a_matched, by = "outputID") %>% 
+  select(-c(pairID, outputID)) %>% 
+  left_join(select(dade_a_matched, -c(pairID, outputID)))
+
+# nrow(dade_wide) + nrow(drop_na(dade_wide, amount3))
+```
+
+
+
+
+
+```{r}
+
+dade_long <- dade_wide %>% 
+  pivot_longer(ends_with(c("1", "2", "3"))) %>%
+  mutate(sale = str_extract(name, "\\d"),
+         name = str_extract(name, "[:alpha:]+")) %>% 
+  pivot_wider() %>% 
+  mutate(date = ymd(paste(year, month, day, sep = "-"))) %>% 
+  drop_na(amount)
+
+dade1 <- dade_long %>% 
+  filter(sale == 1)
+
+# total strata abundance
+total_abundance <- dade1 %>%
+  count(strata, name = "total_n") %>%
+  mutate(total_abundance = total_n / sum(total_n))
+
+# zipcode-level abundance
+zip_abundance <- dade1 %>%
+  mutate(zipcode = factor(zipcode, levels = zip_polys$zipcode, ordered = F),
+         strata = factor(strata, levels = paste0("S", 1:5), ordered = T)) %>% 
+  count(zipcode, strata, name = "zip_n") %>%
+  complete(zipcode, strata, fill = list(zip_n = 0)) %>%   
+  group_by(zipcode) %>% 
+  mutate(zip_abundance = zip_n / sum(zip_n)) %>% 
+  mutate(zipcode = as.numeric(as.character(zipcode)),
+         strata = as.character(strata)) %>% 
+  ungroup()
+
+# compare
+strata_sumry <- zip_abundance %>%
+  left_join(total_abundance, by = "strata") %>%
+  mutate(
+    abundance_ratio = zip_abundance / total_abundance,
+    abundance_diff = zip_abundance - total_abundance
+  )
+```
+
+## Distribution of housing types
+
+
+```{r}
+strata_sumry %>% 
+  group_by(strata) %>% 
+  drop_na() %>% 
+  summarize(proportion = unique(total_abundance),
+            zips_without = sum(zip_abundance == 0)/n()
+            # iqr = IQR(zip_abundance, na.rm = T)
+            ) %>% 
+  kable(digits = 3)
+```
+
+- Strata 3 is the most abundant housing type -- nearly 40% of homes in Dade county (judging by sales data)
+  - does not occur in just 2.7% of residential zips
+- Strata 5 is least abundant overall, and has highest proportion of zips where it does not occur at all
+
+```{r}
+p1 <- strata_sumry %>% 
+  drop_na(zip_abundance) %>% 
+  ggplot(aes(x = zip_abundance, y = strata, fill = strata, colour = strata)) +
+  geom_density_ridges(alpha = 0.6, bw = 0.5) +
+  scale_fill_viridis_d(aesthetics = c("color", "fill")) + 
+  theme(legend.position = "none")
+
+p2 <- strata_sumry %>% 
+  drop_na(abundance_ratio) %>% 
+  ggplot(aes(y = abundance_ratio, x = strata, fill = strata, color = strata)) +
+  geom_violin(alpha = 0.5) +
+  geom_hline(yintercept = 1, linetype = "dotted") +
+  coord_flip() +
+  scale_fill_viridis_d(aesthetics = c("color", "fill")) + 
+  theme(legend.position = "none")
+
+p1 + p2 + theme(axis.title.y = element_blank())
+```
+
+- S3 ratios are concentrated near 1 -- proportion of S3 housing is more constant across zips compared to other housing types
+- S1 and S5 densities peak near zero -- do not occur in 11-12% of zips
+- S4 and S5 ratio distributions are right-skewed -- tend to occur with high concentration in a small number of zips
+
+
+```{r}
+strata_sumry %>% 
+  select(zipcode, strata, zip_abundance) %>% 
+  pivot_wider(names_from = strata, values_from = zip_abundance) %>% 
+  select(-zipcode) %>% 
+  drop_na() %>% 
+  cor() %>% 
+  reshape2::melt() %>% 
+  ggplot(aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(
+    colours = rev(brewer.pal(7, "RdBu")),
+    values = rescale(c(-0.5, 0, 1)),
+    limits = c(-1, 1)
+    )
+
+```
+
+- Housing types tend to cluster:
+  - S1, S2 
+  - S3, S4, S5
+
+
+## Housing type by zip
+
+```{r}
+zip_sumry <- strata_sumry %>% 
+  group_by(zipcode) %>% 
+  summarise(
+    zip_n = sum(zip_n), 
+    flag = case_when(
+      zip_n == 0 ~ "Non-residential",
+      zip_n < 10 ~ "Small sample size"
+      ))
+
+zip_sumry %>% 
+  drop_na(flag) %>% 
+  left_join(zip_polys) %>% 
+  st_as_sf() %>% 
+  ggplot() +
+  geom_sf(data = zip_polys) +
+  geom_sf(aes(fill = flag)) +
+  theme(legend.title = element_blank())
+```
+
+
+```{r}
+downtown <- st_point(c(-80.1902, 25.7734)) %>% 
+  st_sfc(crs = 4326) %>% 
+  st_transform(st_crs(zip_polys$geometry))
+
+p1 <- strata_sumry %>% 
+  group_by(zipcode) %>% 
+  slice_max(zip_abundance, with_ties = F, na_rm = T) %>% 
+  ungroup() %>% 
+  left_join(zip_polys) %>% 
+  st_as_sf() %>% 
+  ggplot() +
+  geom_sf(data = zip_polys) + #grey background for NR zips
+  geom_sf(aes(fill = strata)) +
+  scale_fill_viridis_d() +
+  labs(title = "Most abundant house type") +
+  annotate("point", x = -80.1902, y = 25.7734, shape = 23, size = 2, fill = "red") +
+  coord_sf(default_crs = sf::st_crs(4326)) +
+  theme(axis.title = element_blank())
+
+p2 <- strata_sumry %>% 
+  group_by(zipcode) %>% 
+  slice_max(abundance_ratio, with_ties = F, na_rm = T) %>% 
+  ungroup() %>% 
+  left_join(zip_polys) %>% 
+  st_as_sf() %>% 
+  ggplot() +
+  geom_sf(data = zip_polys) + #bg
+  geom_sf(aes(fill = strata)) +
+  scale_fill_viridis_d() +
+  labs(title = "Highest relative abundance") + 
+  annotate("point", x = -80.1902, y = 25.7734, shape = 23, size = 2, fill = "red") +
+  coord_sf(default_crs = sf::st_crs(4326)) +
+  theme(axis.title = element_blank())
+
+
+p1 + theme(legend.position = "none") + p2
+```
+
+- Most zips have highest proportion of S3 homes
+- "Innner/outer city" pattern -- block of mostly S1 homes NW of downtown, surrounded by high prop of S5 homes 
+- High abundance of S4 homes in suburban areas southwest of downtown
+
+
+```{r}
+strata_heatmap <- function(var, plot_strata = "S3", rng = NULL, midpoint = NULL, palette = rev(brewer.pal(7, "RdBu")), bg = "gray") {
+  pal. <- palette
+  if (!is.null(rng)){
+    rng. <- rng
+  } else {
+    rng. <- range(pull(drop_na(filter(strata_sumry, strata %in% plot_strata), {{var}}), {{var}}))
+  }
+  if (!is.null(midpoint)) {
+    mid. <- midpoint
+  } else {
+    mid. <- mean(rng.)
+  }
+  p <- expand.grid(strata = plot_strata, zipcode = zip_polys$zipcode) %>% 
+  left_join(drop_na(filter(strata_sumry, strata %in% plot_strata), {{var}}), by = c("strata", "zipcode")) %>% 
+  full_join(zip_polys, by = "zipcode") %>% 
+  st_as_sf() %>% 
+  ggplot() +
+  geom_sf(aes(fill = {{var}})) +
+  scale_fill_gradientn(
+    colours = pal.,
+    values = rescale(c(rng.[1], mid., rng.[2])),
+    limits = rng.,
+    na.value = bg
+  )
+  if (length(plot_strata >= 2)) {
+    p <- p + facet_wrap(~ strata)
+  }
+  return(p)
+}
+
+
+strata_heatmap(zip_abundance, plot_strata = "S3", midpoint = 0.5, rng = c(0,1)) + 
+  labs(title = "Proportion") +
+  theme(legend.position = "left") +
+strata_heatmap(abundance_ratio, "S3", midpoint = 1) +
+  labs(title = "Relative abundance")
+
+```
+
+```{r}
+strata_heatmap(var = abundance_ratio, plot_strata = c("S1", "S5"), midpoint = 1)
+```
+
+- some areas near coast have above average abundance of both S1 and S5 housing -- helps explain why S1 less negatively correlated with S5 than S3 and S4
+
+
+
+
+---
+
+## Sales activity by quarter
+
+```{r}
+year_activity <- dade_long %>% 
+  filter(amount < 1e+07) %>% 
+  group_by(year, strata) %>% 
+  summarise(num_sales = n(), 
+            avg_price = mean(amount))
+
+year_activity %>% 
+  ggplot(aes(x = year, y = num_sales, color = strata)) +
+  geom_line()
+
+year_activity %>% 
+  ggplot(aes(x = year, y = avg_price, color = strata)) +
+  geom_line() +
+  scale_y_log10()
+```
+
+```{r}
+total_price <- dade_long %>% 
+  group_by(year) %>% 
+  summarise(total_mean = mean(amount),
+            total_med = median(amount))
+
+zip_price <- dade_long %>% 
+  group_by(year, zipcode) %>% 
+  summarise(zip_mean = mean(amount),
+            zip_med = median(amount))
+
+price_sumry <- zip_price %>% 
+  left_join(total_price) %>% 
+  mutate(mean_ratio = zip_mean/total_mean,
+         med_ratio = zip_med/total_med)
+
+  
+dade_long %>% 
+  group_by(year, zipcode) %>% 
+  summarise(avg_price = mean(amount)) %>% 
+  mutate(year_bin = case_match(year, c(1991, 1992) ~ "1991-2",  c(1993, 1994) ~ "1993-4")) %>% 
+  drop_na(year_bin) %>% 
+  left_join(zip_polys) %>% 
+  st_as_sf() %>% 
+  ggplot(aes(fill = avg_price)) +
+  geom_sf() + 
+  facet_wrap(~year_bin)
+
+
+plot_df <- price_sumry %>% 
+  filter(year %in% c(1992, 1993, 1994))
+
+rng <- range(plot_df$med_ratio)
+
+plot_df %>% 
+  left_join(zip_polys) %>% 
+  st_as_sf() %>% 
+  ggplot() +
+  geom_sf(data = zip_polys) +
+  geom_sf(aes(fill = med_ratio)) +
+  facet_wrap(~year) +
+  scale_fill_gradientn(
+    colours = heat_pal,
+    values = rescale(c(rng[1], 1, rng[2])),
+    limits = rng,
+    na.value = "gray80"
+  )
+```
+
+
+---
+
+
+```{r}
+dade
+
+```
+
+

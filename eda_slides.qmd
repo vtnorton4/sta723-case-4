@@ -1,0 +1,511 @@
+---
+title: "Case 4: Dade County Real Estate"
+subtitle: "Exploratory Data Analysis -- Stratum S3"
+author: "Tory Norton & Savannah Tan"
+date: "March 16, 2026"
+format:
+  beamer:
+    theme: Madrid
+    colortheme: whale
+    fonttheme: structurebold
+    aspectratio: 169
+    toc: false
+    include-in-header:
+      text: |
+        \setbeamertemplate{footline}{}
+        \setbeamerfont{frametitle}{size=\normalsize}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 3.2,
+  fig.align = "center"
+  #out.width = "100%"
+)
+
+library(tidyverse)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+
+library(patchwork)
+library(ggridges)
+library(RColorBrewer)
+heatmap_pal <- rev(brewer.pal(7, "RdBu"))
+
+load("dadeRE.RData")
+
+x$logreturn  <- log(x$amount2 / x$amount1)
+x$hold_years <- (x$year2 + x$month2/12) - (x$year1 + x$month1/12)
+x$yr2_dec    <- x$year2 + (x$month2 - 0.5) / 12
+x$yr1_dec    <- x$year1 + (x$month1 - 0.5) / 12
+x$spans_andrew <- (x$yr1_dec < 1992.583) & (x$yr2_dec >= 1992.583)
+
+# Exclude confirmed data entry errors by outputID
+bad_ids <- c("0132070070100a", "0141100330590a")
+
+s3 <- x %>% filter(strata == "S3", hold_years > 0,
+                    amount1 > 0, amount2 > 0,
+                    !outputID %in% bad_ids)
+
+# 30-year fixed mortgage rates, annual avg (FRED MORTGAGE30US, 1971-1995)
+mortgage <- data.frame(
+  year = 1971:1995,
+  rate = c(7.54, 7.38, 8.04, 9.19, 9.05, 8.87, 8.85, 9.64,
+           11.20, 13.74, 16.63, 16.04, 13.24, 13.88, 12.43,
+           10.19, 10.21, 10.34, 10.32, 10.13, 9.25, 8.39,
+           7.31, 8.38, 7.93)
+)
+
+theme_set(theme_minimal(base_size = 11))
+```
+
+## Background \& Goals
+
+\textbf{Problem:} Home prices vary widely across time and space. Tracking \textit{appreciation} requires separating true market trends from variation in home quality.
+
+\textbf{Repeat-sales approach:} Compare the \textit{same home} sold twice -- quality cancels out, price change reflects pure market appreciation.
+
+\textbf{Data:} 77,493 repeat-sale records, Dade County FL (1971--1995). Focus: \textbf{Stratum S3} -- 3 bed, 2 bath; most common type (40\% of records, $n = 31{,}042$).
+
+\vspace{0.5em}
+
+\textbf{Analysis goals:}
+\begin{enumerate}
+  \item Describe ZIP-level geographic variation in relative abundance of S3 homes
+  \item Describe sales activity by quarter
+  \item Estimate quarterly appreciation rates (1971--1995)
+  \item Assess correlation with 30-year fixed mortgage rates
+\end{enumerate}
+
+\vspace{0.5em}
+\textbf{Key complication:} Hurricane Andrew (Aug 1992) destroyed 63,500+ homes in southern Dade County.
+
+---
+
+## Data Overview \& Quality Issues
+
+```{r}
+issues <- data.frame(
+  Issue = c("Holding period $\\leq$ 0 (sale 2 before sale 1)",
+            "Implausible data entry errors (e.g. \\$111M 2bd/2ba; \\$6.5M S3 resold at \\$90K same year)",
+            "Repeat sales spanning Hurricane Andrew",
+            "\\texttt{xfeat} values 0--4: coding unknown"),
+  N = c(sum(x[x$strata=="S3",]$hold_years <= 0),
+        sum(x[x$strata=="S3",]$outputID %in% bad_ids),
+        sum(s3$spans_andrew),
+        "--"),
+  Action = c("Exclude", "Exclude", "Flag; sensitivity analysis", "Under investigation")
+)
+kable(issues, format = "latex", booktabs = TRUE,
+      col.names = c("Issue", "N", "Action"),
+      escape = FALSE) %>%
+  kable_styling(latex_options = c("striped", "hold_position"), font_size = 8)
+```
+
+\begin{itemize}
+  \item No missing values in any field; \texttt{day1}/\texttt{day2} always = 15 (month-level precision only)
+  \item After cleaning: \textbf{`r nrow(s3)` usable S3 repeat-sale records} across 73 ZIP codes
+  \item \texttt{xfeat} may indicate renovation or unconventional sale type -- needs clarification before modeling
+\end{itemize}
+## Geographic Variation in S3 Abundance
+
+```{r, fig.width=8, fig.height=8, out.width="100%"}
+segs <- read.table("DadeSegs")
+colnames(segs) <- c("long1", "lat1", "long2", "lat2", "zip", "mystery")
+
+# Create sf for mapping
+temp_env <- new.env()
+source("zip_polys.R", local = temp_env)
+zip_polys <- temp_env$zip_polys
+zip_lines <- temp_env$lines
+rm(temp_env)
+```
+
+
+```{r, fig.width=8, fig.height=8, out.width="100%"}
+load("dadeRE.RData")
+dade <- x
+
+# create a wide version where each home is a row
+bID <- filter(dade, pairID == "b")$propertyID
+dade_a_matched <- dade %>% 
+  filter(pairID == "a", propertyID %in% bID) %>% 
+  rename_with(
+      ~ str_replace(
+          .x,
+          "\\d+$",
+          ~ as.character(as.numeric(.x) + 1)
+        ),
+      matches("\\d+$")
+    )
+dade_wide <- dade %>% 
+  anti_join(dade_a_matched, by = "outputID") %>% 
+  select(-c(pairID, outputID)) %>% 
+  left_join(select(dade_a_matched, -c(pairID, outputID)))
+
+# long version: each sale is a row
+dade_long <- dade_wide %>% 
+  pivot_longer(ends_with(c("1", "2", "3"))) %>%
+  mutate(sale = str_extract(name, "\\d"),
+         name = str_extract(name, "[:alpha:]+")) %>% 
+  pivot_wider() %>% 
+  mutate(date = ymd(paste(year, month, day, sep = "-"))) %>% 
+  drop_na(amount)
+
+# first sale only: better reflection of housing stock
+dade1 <- dade_long %>% 
+  filter(sale == 1)
+
+
+## Summaries of zipcode-level variation
+# total strata abundance
+total_abundance <- dade1 %>%
+  count(strata, name = "total_n") %>%
+  mutate(total_abundance = total_n / sum(total_n))
+
+# zipcode-level abundance
+zip_abundance <- dade1 %>%
+  mutate(zipcode = factor(zipcode, levels = zip_polys$zipcode, ordered = F),
+         strata = factor(strata, levels = paste0("S", 1:5), ordered = T)) %>% 
+  count(zipcode, strata, name = "zip_n") %>%
+  complete(zipcode, strata, fill = list(zip_n = 0)) %>%   
+  group_by(zipcode) %>% 
+  mutate(zip_abundance = zip_n / sum(zip_n)) %>% 
+  mutate(zipcode = as.numeric(as.character(zipcode)),
+         strata = as.character(strata)) %>% 
+  ungroup()
+
+# compare
+strata_sumry <- zip_abundance %>%
+  left_join(total_abundance, by = "strata") %>%
+  mutate(
+    abundance_ratio = zip_abundance / total_abundance,
+    abundance_diff = zip_abundance - total_abundance
+  )
+```
+
+
+
+```{r, out.height="60%", fig.align="center", fig.dim=c(8,8)}
+theme_set(theme_light(base_size = 10))
+
+zip_sumry <- strata_sumry %>% 
+  group_by(zipcode) %>% 
+  summarise(
+    zip_n = sum(zip_n), 
+    flag = case_when(
+      zip_n == 0 ~ "No data",
+      zip_n < 10 ~ "Small sample size"
+      ))
+
+flagged_zips <- zip_sumry$zipcode[!is.na(zip_sumry$flag)]
+strata_sumry_clean <- strata_sumry %>% 
+  filter(!zipcode %in% flagged_zips)
+
+p1 <- zip_sumry %>% 
+  drop_na(flag) %>% 
+  left_join(zip_polys) %>% 
+  st_as_sf() %>% 
+  ggplot() +
+  geom_sf(data = zip_polys) +
+  geom_sf(aes(fill = flag)) +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "left"
+  ) +
+  labs(title = "Excluded from EDA")
+
+p_tot <- filter(total_abundance, strata == "S3") %>% pull(total_abundance)
+
+p2 <- strata_sumry_clean %>% 
+  filter(strata == "S3") %>% 
+  full_join(zip_polys, by = "zipcode") %>% 
+  st_as_sf() %>% 
+  ggplot() +
+  geom_sf(aes(fill = zip_abundance)) +
+  scale_fill_gradientn(
+    colours = heatmap_pal,
+    limits = c(0, 1),
+    na.value = "gray"
+  ) +
+  # theme_bw() +
+  labs(
+    title = "Proportion of S3 Housing",
+    fill = "Proportion"
+  )
+
+p1 + p2
+```
+
+- Proportion of S3 housing ranges between 0.04 and 0.79
+---
+
+## Geographic Variation in Housing Type
+
+```{r, fig.dim=c(8,8), out.height="60%"}
+
+p1 <- strata_sumry_clean %>% 
+  group_by(zipcode) %>% 
+  slice_max(zip_abundance, with_ties = F, na_rm = T) %>% 
+  ungroup() %>% 
+  left_join(zip_polys) %>% 
+  st_as_sf() %>% 
+  ggplot() +
+  geom_sf(data = zip_polys) + #grey background for NR zips
+  geom_sf(aes(fill = strata)) +
+  scale_fill_viridis_d() +
+  labs(title = "Most Abundant Housing Type") +
+  annotate("point", x = -80.1902, y = 25.7734, shape = 23, size = 2, fill = "red") +
+  coord_sf(default_crs = sf::st_crs(4326)) +
+  # theme_bw() +
+  theme(axis.title = element_blank()) 
+
+p2 <- strata_sumry_clean %>% 
+  group_by(zipcode) %>% 
+  slice_max(abundance_ratio, with_ties = F, na_rm = T) %>% 
+  ungroup() %>% 
+  left_join(zip_polys) %>% 
+  st_as_sf() %>% 
+  ggplot() +
+  geom_sf(data = zip_polys) + #bg
+  geom_sf(aes(fill = strata)) +
+  scale_fill_viridis_d() +
+  labs(title = "Highest Relative Abundance") + 
+  annotate("point", x = -80.1902, y = 25.7734, shape = 23, size = 2, fill = "red") +
+  coord_sf(default_crs = sf::st_crs(4326)) +
+  # theme_bw() +
+  theme(axis.title = element_blank()) 
+
+
+p1 + theme(legend.position = "none") + p2
+```
+
+- Relative abundance: within-zip proportion of housing type, normalized by total proportion
+
+<!-- - $p_{j}$ stratum $j$ total proportion of housing stock  -->
+<!-- - $p_{z,j}$ stratum $j$ proportion in zipcode $z$  -->
+
+<!-- $$ -->
+<!-- \text{Abundance ratio}_{z,j} = \frac{p_{z,j}}{p_j} -->
+<!-- $$ -->
+
+
+---
+
+## Geographic Variation in Housing Type
+
+```{r, out.width="90%"}
+p1 <- strata_sumry_clean %>% 
+  drop_na(zip_abundance) %>% 
+  ggplot(aes(x = zip_abundance, y = strata, fill = strata, colour = strata)) +
+  geom_density_ridges(alpha = 0.6, bw = 0.5) +
+  scale_fill_viridis_d(aesthetics = c("color", "fill")) + 
+  theme_light() +
+  theme(legend.position = "none") +
+  labs(
+    x = "Proportion",
+    title = "Distribution Across Zipcodes",
+    y = "Stratum"
+  )
+  
+p2 <- strata_sumry_clean %>% 
+  drop_na(abundance_ratio) %>% 
+  ggplot(aes(x = abundance_ratio, y = strata, fill = strata, color = strata)) +
+  geom_violin(alpha = 0.5) +
+  geom_vline(xintercept = 1, linetype = "dotted") +
+  scale_fill_viridis_d(aesthetics = c("color", "fill")) + 
+  theme_light() +
+  theme(
+    legend.position = "none",
+    axis.title.y = element_blank()
+    ) +
+  labs(
+    x = "Abundance Ratio"
+  )
+
+
+(p1 + p2)
+```
+
+- S3 housing is more evenly spread across zips compared to other housing types
+
+---
+
+## Correlation Between Housing Types
+
+```{r, out.height="60%", fig.dim=c(6, 4)}
+strata_sumry_clean %>% 
+  select(zipcode, strata, zip_abundance) %>% 
+  pivot_wider(names_from = strata, values_from = zip_abundance) %>% 
+  select(-zipcode) %>% 
+  drop_na() %>% 
+  cor() %>% 
+  reshape2::melt() %>% 
+  ggplot(aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(
+    colours = rev(brewer.pal(7, "RdBu")),
+    # values = scales::rescale(c(-1, 0, 1)),
+    limits = c(-1, 1)
+    ) +
+  theme_minimal(base_size = 11) +
+  theme(axis.title = element_blank()) +
+  labs(fill = "Correlation")
+```
+
+- Housing strata tend to cluster into 2-3 groups
+- S3 housing is positively correlated with S4, but not S2
+---
+
+## Sales Volume \& Mortgage Rate Correlation
+
+```{r fig.height=2.8, fig.width=8}
+sales_yr <- s3 %>% count(year2, name = "n_sales") %>%
+  filter(year2 >= 1971, year2 <= 1995)
+
+combined <- mortgage %>%
+  left_join(sales_yr, by = c("year" = "year2"))
+
+p1 <- ggplot(mortgage) +
+  geom_line(aes(x = year, y = rate), color = "darkorange", linewidth = 0.9) +
+  geom_vline(xintercept = 1992.583, color = "red", linetype = "dashed", linewidth = 0.5) +
+  scale_x_continuous(breaks = seq(1973, 1995, by = 4)) +
+  labs(x = "Year", y = "Rate (%)", title = "30-yr Fixed Mortgage Rate") +
+  theme_minimal(base_size = 9)
+
+p2 <- ggplot(combined %>% filter(!is.na(n_sales))) +
+  geom_line(aes(x = year, y = n_sales), color = "steelblue", linewidth = 0.9) +
+  geom_vline(xintercept = 1992.583, color = "red", linetype = "dashed", linewidth = 0.5) +
+  scale_x_continuous(breaks = seq(1973, 1995, by = 4)) +
+  labs(x = "Year", y = "Annual sales", title = "S3 Annual Sales Volume") +
+  theme_minimal(base_size = 9)
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+\small
+\begin{itemize}
+  \item \textbf{Sales volume} strongly inversely correlated with mortgage rates -- dips when 30-yr rates peaked at $\sim$16\% (1979--82), increases as rates fall through the late 1980s
+\end{itemize}
+
+---
+
+## Hurricane Andrew
+
+\small \textbf{Andrew-spanning:} first sale before Aug 1992 AND second sale on/after Aug 1992
+
+```{r fig.height=2, fig.width=8}
+s3$group <- ifelse(s3$spans_andrew, "Spans Andrew", "Other")
+
+p1 <- s3 %>%
+  filter(logreturn > -3, logreturn < 4) %>%
+  ggplot(aes(x = logreturn, fill = group)) +
+  geom_density(alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_fill_manual(values = c("Spans Andrew" = "red", "Other" = "steelblue")) +
+  labs(x = "Raw log return", y = "Density", fill = "",
+       title = "Raw Log Return") +
+  theme_minimal(base_size = 9) + theme(legend.position = "top")
+
+p2 <- s3 %>%
+  filter(logreturn > -3, logreturn < 4, hold_years > 0) %>%
+  mutate(ann_return = logreturn / hold_years) %>%
+  filter(ann_return > -0.5, ann_return < 0.5) %>%
+  ggplot(aes(x = ann_return, fill = group)) +
+  geom_density(alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_fill_manual(values = c("Spans Andrew" = "red", "Other" = "steelblue")) +
+  labs(x = "Annualized log return", y = "Density", fill = "",
+       title = "Annualized Return (controls for holding period)") +
+  theme_minimal(base_size = 9) + theme(legend.position = "top")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+\vspace{0.2em}
+\begin{itemize}
+  \item Raw returns slightly \textit{higher} for spanning
+  \item \textbf{Explanation:} spanning sales held 3 years longer on average -- extra years of 1980s boom override hurricane damage
+  \item Once annualized (right plot), spanning sales show a slightly lower return -- modest drag, but damage signal still weak overall
+\end{itemize}
+
+---
+
+## Hurricane Andrew
+
+```{r fig.height=2.19, fig.width=8}
+andrew_zips <- c(33196, 33187, 33186, 33177, 33157, 33176, 33158, 33156)
+s3$zone <- ifelse(s3$zipcode %in% andrew_zips, "Andrew zone\n(southern ZIPs)", "Other ZIPs")
+s3$price_drop <- s3$amount2 < s3$amount1
+andrew     <- s3[s3$spans_andrew, ]
+non_andrew <- s3[!s3$spans_andrew, ]
+
+# Map
+segs <- read.table("DadeSegs")
+colnames(segs) <- c("long1","lat1","long2","lat2","zip","mystery")
+long.mean <- aggregate(segs$long1, by=list(segs$zip), FUN="mean")
+lat.mean  <- aggregate(segs$lat1,  by=list(segs$zip), FUN="mean")
+zip.loc   <- data.frame(zip=lat.mean$Group.1, lat=lat.mean$x, long=long.mean$x)
+zip.loc$andrew_zone <- zip.loc$zip %in% andrew_zips
+
+# Bar chart data
+drop_df <- data.frame(
+  zone     = rep(c("Andrew zone", "Other ZIPs"), 2),
+  group    = rep(c("Spans Andrew", "Does not span"), each = 2),
+  pct_drop = c(
+    100 * mean(andrew$price_drop[andrew$zone == "Andrew zone\n(southern ZIPs)"], na.rm=TRUE),
+    100 * mean(andrew$price_drop[andrew$zone == "Other ZIPs"], na.rm=TRUE),
+    100 * mean(non_andrew$price_drop[non_andrew$zone == "Andrew zone\n(southern ZIPs)"], na.rm=TRUE),
+    100 * mean(non_andrew$price_drop[non_andrew$zone == "Other ZIPs"], na.rm=TRUE)
+  )
+)
+
+par(mfrow = c(1, 2), mar = c(3, 3, 2, 1))
+
+# Left: ZIP map with Andrew zone highlighted
+x.min <- min(c(segs$long1, segs$long2)); x.max <- max(c(segs$long1, segs$long2))
+y.min <- min(c(segs$lat1,  segs$lat2));  y.max <- max(c(segs$lat1,  segs$lat2))
+plot(c(x.min, x.max), c(y.min, y.max), type = "n",
+     xlab = "longitude", ylab = "latitude", main = "Andrew Zone ZIPs",
+     cex.main = 0.9, cex.axis = 0.7, cex.lab = 0.8)
+segments(x0=segs$long1, y0=segs$lat1, x1=segs$long2, y1=segs$lat2, lwd=0.5, col="gray60")
+# Only label Andrew zone ZIPs, with manual nudge for 33196 and 33186
+andrew_loc <- zip.loc[zip.loc$andrew_zone, ]
+nudge_long <- ifelse(andrew_loc$zip == 33196, -0.02,
+              ifelse(andrew_loc$zip == 33186,  0.02, 0))
+text(x = andrew_loc$long + nudge_long,
+     y = andrew_loc$lat,
+     labels = andrew_loc$zip,
+     cex = 0.55, col = "red", font = 2)
+abline(h = 25.62, lty = 1, lwd = 1.5, col = "red")
+abline(h = 25.68, lty = 2, lwd = 1.5, col = "red")
+legend("topright", legend = c("Andrew zone", "Hurricane path", "Eyewall"),
+       col = c("red","red","red"), lty = c(NA,1,2), pch = c(16,NA,NA),
+       cex = 0.6, pt.cex = 0.8)
+
+# Right: bar chart
+bp <- barplot(matrix(c(20.1, 10.4, 6.2, 8.0), nrow=2,
+                     dimnames=list(c("Spans Andrew","Does not span"),
+                                   c("Andrew zone","Other ZIPs"))),
+              beside = TRUE, col = c("red","steelblue"),
+              main = "% Sales with Price Drop", cex.main = 0.9,
+              ylab = "%", ylim = c(0, 26), cex.names = 0.8, cex.axis = 0.7)
+correct_vals <- c(20.1, 10.4, 6.2, 8.0)
+text(bp, correct_vals + 1,
+     labels = paste0(correct_vals, "%"), cex = 0.7)
+legend("topright", legend = c("Spans Andrew","Does not span"),
+       fill = c("red","steelblue"), cex = 0.7)
+
+par(mfrow = c(1,1))
+```
+\small
+\begin{itemize}
+  \item Since the spanning flag alone is a weak signal, we split by geography: 8 ZIPs along the hurricane path define the ``Andrew zone''. Among spanning sales, Andrew zone shows \textbf{20.1\%} price drops vs.\ \textbf{6.2\%} in other ZIPs -- confirming real damage concentrated in these areas
+  \item Non-spanning sales show similar rates in both zones, suggesting the geographic gap is specific to Andrew. The 1,199 Andrew-zone spanning sales might suggest a sensitivity analysis with and without these records
+\end{itemize}
+
