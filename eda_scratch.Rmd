@@ -17,8 +17,8 @@ library(RColorBrewer)
 library(ggridges)
 
 library(knitr)
-theme_set(theme_bw())
-heat_pal <- rev(brewer.pal(7, "RdBu"))
+theme_set(theme_light())
+heatmap_pal <- rev(brewer.pal(7, "RdBu"))
 ```
 
 
@@ -33,6 +33,49 @@ zip_polys <- temp_env$zip_polys
 zip_lines <- temp_env$lines
 rm(temp_env)
 ```
+
+
+```{r}
+lat_n <- 25.68
+lat_s <- 25.3
+  
+andy_rect <- st_sf(
+  geometry = st_sfc(
+    st_polygon(list(matrix(
+      c(-180, lat_n,
+        180,  lat_n,
+        180,  lat_s,
+        -180, lat_s,
+        -180, lat_n),
+      ncol = 2,
+      byrow = TRUE
+    ))),
+    crs = 4326
+  )
+) %>% 
+  st_transform(st_crs(zip_polys))
+
+andy_north <- st_sf(
+  geometry = st_sfc(
+    st_linestring(matrix(
+      c(-180, lat_n,
+        180,  lat_n),
+      ncol = 2,
+      byrow = TRUE
+    )),
+    crs = 4326
+  )
+) %>% 
+  st_transform(st_crs(zip_polys))
+
+
+zip_polys$hurricane <- as.logical(lengths(st_intersects(zip_polys, andy_rect)) > 0)
+
+zip_polys %>% 
+  ggplot() +
+  geom_sf(aes(fill = hurricane))
+```
+
 
 ```{r}
 load("dadeRE.RData")
@@ -61,13 +104,6 @@ dade_wide <- dade %>%
   left_join(select(dade_a_matched, -c(pairID, outputID)))
 
 # nrow(dade_wide) + nrow(drop_na(dade_wide, amount3))
-```
-
-
-
-
-
-```{r}
 
 dade_long <- dade_wide %>% 
   pivot_longer(ends_with(c("1", "2", "3"))) %>%
@@ -80,6 +116,22 @@ dade_long <- dade_wide %>%
 dade1 <- dade_long %>% 
   filter(sale == 1)
 
+# Add quarters
+dade <- dade %>% 
+  mutate(
+    date1 = ymd(paste(year1, month1, day1, sep = "-")),
+    date2 = ymd(paste(year2, month2, day2, sep = "-")),
+    q1 = floor_date(date1, "quarter"),
+    q2 = floor_date(date2, "quarter")
+    ) %>% 
+  filter(date1 <= date2)
+
+dade_long <- dade_long %>% 
+  mutate(q = floor_date(date, "quarter"))
+
+```
+
+```{r}
 # total strata abundance
 total_abundance <- dade1 %>%
   count(strata, name = "total_n") %>%
@@ -98,13 +150,123 @@ zip_abundance <- dade1 %>%
   ungroup()
 
 # compare
-strata_sumry <- zip_abundance %>%
+strata_sumry0 <- zip_abundance %>%
   left_join(total_abundance, by = "strata") %>%
   mutate(
     abundance_ratio = zip_abundance / total_abundance,
     abundance_diff = zip_abundance - total_abundance
   )
+
+# remove zips with little data 
+zip_sumry <- strata_sumry0 %>% 
+  group_by(zipcode) %>% 
+  summarise(
+    zip_n = sum(zip_n), 
+    flag = case_when(
+      zip_n == 0 ~ "No data",
+      zip_n < 10 ~ "Small sample size"
+      )) %>% 
+  left_join(select(as.data.frame(zip_polys), -geometry))
+
+flagged_zips <- zip_sumry$zipcode[!is.na(zip_sumry$flag)]
+strata_sumry <- strata_sumry0 %>% 
+  filter(!zipcode %in% flagged_zips)
 ```
+
+```{r}
+year_activity <- dade_long %>% 
+  filter(amount < 1e+07) %>% 
+  group_by(year, strata) %>% 
+  summarise(num_sales = n(), 
+            avg_price = mean(amount))
+```
+
+
+
+### Test color palettes
+
+```{r}
+#map
+m <- strata_sumry %>% 
+  group_by(zipcode) %>% 
+  slice_max(abundance_ratio, with_ties = F, na_rm = T) %>% 
+  ungroup() %>% 
+  left_join(zip_polys) %>% 
+  st_as_sf() %>% 
+  ggplot() +
+  geom_sf(data = zip_polys) + #grey background for NR zips
+  geom_sf(aes(fill = strata))
+#lineplot
+l <- year_activity %>% 
+  ggplot(aes(x = year, y = num_sales, color = strata)) +
+  geom_line()
+
+library(gridExtra)
+
+# pal1 <- c("#08306B", "#2171B5", "#4292C6", "#6BAED6", "#9ECAE1")
+# pal2 <- c("#0B3C49", "#146C73", "#2A9D8F", "#6FC2B0", "#BFE5D6")
+pal3 <- c("#1B3A4B", "#285C73", "#3E8E9E", "#73BFB8", "#A9D6CB")
+pal4 <- c("#4A1486", "#6A51A3", "#807DBA", "#8DA0CB", "#A6BDD7")
+pal5 <- viridisLite::viridis(5, begin = 0.05, end = 0.9)
+pal_metal <- c(
+  "#5A3A1B",  # bronze
+  "#8C6D46",  # lighter bronze
+  "#B8B8B8",  # silver
+  "#D4AF37",  # gold
+  "#F1D97A"   # light gold
+)
+pal_forest <- c( #UGLY!
+  "#5E3C2C",
+  "#7F5539",
+  "#588157",
+  "#3A7D44",
+  "#1B4332"
+)
+pal6 <- c(
+  "#2B2D6E",
+  "#3F5AA6",
+  "#4C8ED9",
+  "#5FB5B2",
+  "#8ED1C6"
+)
+pal7 <- c(
+  "#2F3E46",
+  "#354F52",
+  "#52796F",
+  "#84A98C",
+  "#A4C3B2"
+)
+pal8 <- c(
+  "#3B0F70",
+  "#8C2981",
+  "#DE4968",
+  "#F66E5B",
+  "#FE9F6D"
+)
+
+library(colorspace)
+
+
+pal_test <- sequential_hcl(
+  5,
+  palette = "Viridis"
+)
+
+m + scale_fill_manual(values = pal_test)
+l + scale_color_manual(values = pal_test)
+
+pal_strata <- sequential_hcl(
+  5,
+  palette = "Viridis"
+)
+```
+
+
+Problems:
+- 45 rows where date1 > date2
+  - just switch dates? switch amounts? drop?
+- 2 sales with pairID b have no match in a
+
 
 ## Distribution of housing types
 
@@ -161,7 +323,6 @@ strata_sumry %>%
   geom_tile() +
   scale_fill_gradientn(
     colours = rev(brewer.pal(7, "RdBu")),
-    values = rescale(c(-0.5, 0, 1)),
     limits = c(-1, 1)
     )
 
@@ -175,14 +336,14 @@ strata_sumry %>%
 ## Housing type by zip
 
 ```{r}
-zip_sumry <- strata_sumry %>% 
-  group_by(zipcode) %>% 
-  summarise(
-    zip_n = sum(zip_n), 
-    flag = case_when(
-      zip_n == 0 ~ "Non-residential",
-      zip_n < 10 ~ "Small sample size"
-      ))
+# zip_sumry <- strata_sumry %>% 
+#   group_by(zipcode) %>% 
+#   summarise(
+#     zip_n = sum(zip_n), 
+#     flag = case_when(
+#       zip_n == 0 ~ "Non-residential",
+#       zip_n < 10 ~ "Small sample size"
+#       ))
 
 zip_sumry %>% 
   drop_na(flag) %>% 
@@ -240,51 +401,48 @@ p1 + theme(legend.position = "none") + p2
 
 
 ```{r}
-strata_heatmap <- function(var, plot_strata = "S3", rng = NULL, midpoint = NULL, palette = rev(brewer.pal(7, "RdBu")), bg = "gray") {
-  pal. <- palette
-  if (!is.null(rng)){
-    rng. <- rng
-  } else {
-    rng. <- range(pull(drop_na(filter(strata_sumry, strata %in% plot_strata), {{var}}), {{var}}))
-  }
-  if (!is.null(midpoint)) {
-    mid. <- midpoint
-  } else {
-    mid. <- mean(rng.)
-  }
-  p <- expand.grid(strata = plot_strata, zipcode = zip_polys$zipcode) %>% 
-  left_join(drop_na(filter(strata_sumry, strata %in% plot_strata), {{var}}), by = c("strata", "zipcode")) %>% 
+p_tot <- filter(total_abundance, strata == "S3") %>% pull(total_abundance)
+
+
+strata_sumry %>% 
+  filter(strata == "S3") %>% 
   full_join(zip_polys, by = "zipcode") %>% 
   st_as_sf() %>% 
   ggplot() +
-  geom_sf(aes(fill = {{var}})) +
-  scale_fill_gradientn(
-    colours = pal.,
-    values = rescale(c(rng.[1], mid., rng.[2])),
-    limits = rng.,
-    na.value = bg
+  geom_sf(aes(fill = zip_n)) +
+  scale_fill_distiller(
+    palette = "RdBu", 
+    na.value = "grey"
+    # labels = scales::percent,
+    # limits = c(0, 0.8)
+    ) +
+  labs(
+    title = "Number of S3 Homes",
+    fill = ""
   )
-  if (length(plot_strata >= 2)) {
-    p <- p + facet_wrap(~ strata)
-  }
-  return(p)
-}
 
+rng <- filter(strata_sumry, strata == "S3")$zip_abundance %>% range(na.rm = T)
 
-strata_heatmap(zip_abundance, plot_strata = "S3", midpoint = 0.5, rng = c(0,1)) + 
-  labs(title = "Proportion") +
-  theme(legend.position = "left") +
-strata_heatmap(abundance_ratio, "S3", midpoint = 1) +
-  labs(title = "Relative abundance")
+strata_sumry %>% 
+  filter(strata == "S3") %>% 
+  full_join(zip_polys, by = "zipcode") %>% 
+  st_as_sf() %>% 
+  ggplot() +
+  geom_sf(aes(fill = zip_abundance)) +
+  scale_fill_distiller(
+    palette = "RdBu", 
+    na.value = "grey", 
+    labels = scales::percent,
+    values = rescale(c(rng[1], 0.5, rng[2]))
+    # limits = c(0, 0.8)
+    ) +
+  labs(
+    title = "Proportion of S3 Homes",
+    fill = ""
+  )
+
 
 ```
-
-```{r}
-strata_heatmap(var = abundance_ratio, plot_strata = c("S1", "S5"), midpoint = 1)
-```
-
-- some areas near coast have above average abundance of both S1 and S5 housing -- helps explain why S1 less negatively correlated with S5 than S3 and S4
-
 
 
 
@@ -293,12 +451,6 @@ strata_heatmap(var = abundance_ratio, plot_strata = c("S1", "S5"), midpoint = 1)
 ## Sales activity by quarter
 
 ```{r}
-year_activity <- dade_long %>% 
-  filter(amount < 1e+07) %>% 
-  group_by(year, strata) %>% 
-  summarise(num_sales = n(), 
-            avg_price = mean(amount))
-
 year_activity %>% 
   ggplot(aes(x = year, y = num_sales, color = strata)) +
   geom_line()
@@ -363,8 +515,257 @@ plot_df %>%
 
 
 ```{r}
-dade
+andrew_qtr <- floor_date(ymd("1992-08-24"), "quarter")
+  
+qtr_activity <- dade_long %>%
+  filter(amount < 1e+07) %>%
+  group_by(q, strata) %>%
+  summarise(
+    num_sales = n(), 
+    avg_price = mean(amount)
+    ) %>% 
+  mutate(S3 = strata == "S3")
+
+qtr_activity %>% 
+  ggplot(aes(x = q, y = num_sales, color = strata, alpha = S3)) +
+  geom_line(linewidth = 0.7) +
+  scale_alpha_manual(values = c(0.5, 1)) +
+  scale_color_manual(values = pal_strata) +
+  guides(alpha = "none") +
+  geom_vline(xintercept = andrew_qtr, color = "red", linetype = "dashed")
+
+qtr_activity %>% 
+  ggplot(aes(x = q, y = avg_price, color = strata, alpha = S3)) +
+  geom_line(linewidth = 0.7) +
+  scale_y_log10() +
+  scale_color_manual(values = pal_strata) +
+  scale_alpha_manual(values = c(0.5, 1)) +
+  guides(alpha = "none") +
+  geom_vline(xintercept = andrew_qtr, color = "red", linetype = "dashed")
 
 ```
 
+```{r}
+qtr_activity_storm <- dade_long %>%
+  left_join(select(zip_sumry, zipcode, hurricane)) %>% 
+  filter(amount < 1e+07) %>%
+  group_by(q, strata, hurricane) %>%
+  summarise(
+    num_sales = n(), 
+    avg_price = mean(amount),
+    med_price = median(amount)
+    ) %>% 
+  mutate(S3 = strata == "S3") %>% 
+  ungroup()
+
+
+qtr_activity_storm %>% 
+  filter(S3) %>% 
+  ggplot(aes(x = q, y = num_sales, color = hurricane)) +
+  geom_line(linewidth = 0.7) +
+  # scale_color_manual(values = pal_strata) +
+  guides(alpha = "none") +
+  geom_vline(xintercept = andrew_qtr, color = "red", linetype = "dashed") +
+  scale_color_manual(values = c("steelblue2", "orange3"))
+qtr_activity_storm %>% 
+  filter(S3) %>% 
+  ggplot(aes(x = q, y = avg_price, color = hurricane)) +
+  geom_line(linewidth = 0.7) +
+  # scale_color_manual(values = pal_strata) +
+  guides(alpha = "none") +
+  geom_vline(xintercept = andrew_qtr, color = "red", linetype = "dashed") +
+  scale_color_manual(values = c("steelblue2", "orange3"))
+qtr_activity_storm %>% 
+  filter(S3) %>% 
+  ggplot(aes(x = q, y = med_price, color = hurricane)) +
+  geom_line(linewidth = 0.7) +
+  # scale_color_manual(values = pal_strata) +
+  guides(alpha = "none") +
+  geom_vline(xintercept = andrew_qtr, color = "red", linetype = "dashed") +
+  scale_color_manual(values = c("steelblue2", "orange3"))
+
+```
+
+---
+
+## Modeling
+
+
+```{r}
+dade <- dade %>%
+  mutate(log_return = log(amount2) - log(amount1))
+
+# List all quarters in your dataset
+all_quarters <- seq(min(c(dade$q1, dade$q2)), max(c(dade$q1, dade$q2)), by = "quarter")
+
+# Map quarters to numeric indices
+quarter_index <- setNames(seq_along(all_quarters), all_quarters)
+dade <- dade %>%
+  mutate(
+    q1_idx = quarter_index[as.character(q1)],
+    q2_idx = quarter_index[as.character(q2)]
+  )
+
+n_quarters <- length(all_quarters)
+X <- matrix(0, nrow = nrow(dade), ncol = n_quarters - 1)
+
+for (i in 1:nrow(dade)) {
+  X[i, dade$q1_idx[i]:(dade$q2_idx[i]-1)] <- 1
+}
+
+y <- dade$log_return
+index_coef <- solve(crossprod(X), crossprod(X, y))
+index_levels <- c(0, cumsum(index_coef))  # start index at 0
+
+data.frame(
+  quarter = all_quarters, 
+  index = index_levels,
+  rate = c(1, exp(index_coef))
+  ) %>% 
+  ggplot(aes(x = quarter, y = rate)) +
+  geom_line()
+
+
+```
+
+
+### Pissing me off
+
+```{r}
+# dade_df <- dade %>%
+#   mutate(
+#     qs_spanned = purrr::map2(q1, q2, ~ seq(.x, .y, by = "quarter"))
+#     )
+# 
+# dade_df <- dade_df %>% 
+#   mutate(
+#     log_p1 = log(amount1),
+#     log_p2 = log(amount2)
+#   )
+
+library(Matrix)
+
+all_q <- seq(min(dade$q1), max(dade$q2), by = "quarter")
+q_index <- setNames(seq_along(all_q), all_q)
+nq <- length(all_q)
+
+dade <- dade %>%
+  mutate(
+    i1 = q_index[as.character(q1)],
+    i2 = q_index[as.character(q2)]
+  )
+```
+
+
+```{r}
+df <- dade
+n <- nrow(df)
+
+rows <- c(seq_len(n), seq_len(n))
+cols <- c(df$i1, df$i2)
+vals <- c(rep(-1, n), rep(1, n))
+
+X <- sparseMatrix(
+  i = rows,
+  j = cols,
+  x = vals,
+  dims = c(n, nq)
+)
+
+y <- log(df$amount2) - log(df$amount1)
+beta <- solve(crossprod(X), crossprod(X, y))
+app_rates <- exp(beta) %>% as.vector()
+
+df_lm <- as.data.frame(as.matrix(X))
+fit <- lm(y ~ . -1, data = df_lm)  # no intercept
+
+app_rates_rel <- app_rates / app_rates[1]
+rate_lm_rel <- exp(coef(fit)) / exp(coef(fit)[1])
+
+rs_rates <- data.frame(
+  quarter = all_q,
+  rate = app_rates,
+  rate_lm = exp(coef(fit))
+  # rate2 = rate2
+)
+
+rs_rates %>% 
+  pivot_longer(!"quarter") %>% 
+# rs_rates %>% 
+  ggplot(aes(x = quarter, y = value, color = name)) +
+  geom_line()
+
+
+```
+
+
+```{r}
+library(Rlinsolve)
+
+df <- dade %>%
+  filter(strata == "S3")
+
+n <- nrow(df)
+
+rows <- c(seq_len(n), seq_len(n))
+cols <- c(df$i1, df$i2)
+vals <- c(rep(-1, n), rep(1, n))
+
+X <- sparseMatrix(
+  i = rows,
+  j = cols,
+  x = vals,
+  dims = c(n, nq)
+)
+y <- log(df$amount2) - log(df$amount1)
+
+df_lm <- as.data.frame(as.matrix(X))
+fit <- lm(y ~ . - 1, data = df_lm)  # no intercept
+
+# beta <- lsolve.bicg(crossprod(X), crossprod(X, y))
+beta <- solve(crossprod(X), crossprod(X, y))
+
+#if fails
+cholX <- Cholesky(crossprod(X))
+beta <- solve(cholX, crossprod(X, y))
+
+app_rates3 <- exp(beta) %>% as.vector()
+
+#if fails
+library(RSpectra)
+beta <- lsqr(X, y)$x
+
+rs_regression <- function(df) {
+  n <- nrow(df)
+  rows <- c(seq_len(n), seq_len(n))
+  cols <- c(df$i1, df$i2)
+  vals <- c(rep(-1, n), rep(1, n))
+  
+  X <- sparseMatrix(
+    i = rows,
+    j = cols,
+    x = vals,
+    dims = c(n, nq)
+  )
+  
+  y <- log(df$amount2) - log(df$amount1)
+  
+  beta <- solve(crossprod(X), crossprod(X, y))
+  app_rates <- exp(beta)
+  rs_rates <- data.frame(
+    quarter = all_q,
+    rate = as.vector(app_rates)
+  )
+  return(rs_rates)
+}
+
+strata <- paste0("S", 1:5)
+
+strata_rates <- lapply(strata, \(s) rs_regression(filter(dade, strata == s)))
+
+rs_rates %>% 
+  pivot_longer(!"quarter") %>% 
+  ggplot(aes(x = quarter, y = value, color = name)) +
+  geom_line()
+```
 
